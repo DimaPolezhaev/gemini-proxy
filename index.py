@@ -52,7 +52,7 @@ def generate():
 
     url = (
         "https://generativelanguage.googleapis.com/v1beta/"
-        "models/gemini-2.5-flash:generateContent"
+        "models/gemini-2.0-flash:generateContent"
         f"?key={GEMINI_API_KEY}"
     )
 
