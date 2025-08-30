@@ -57,7 +57,7 @@ def generate():
     )
 
     try:
-        r = requests.post(url, json=payload, timeout=10)
+        r = requests.post(url, json=payload, timeout=30)
         r.raise_for_status()
         text = (r.json()
                  .get("candidates", [{}])[0]
