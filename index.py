@@ -14,18 +14,16 @@ def cors(payload, code=200):
     resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
     return resp
 
+
+# Пинг
 @app.route("/ping", methods=["GET", "OPTIONS"])
 def ping():
     if request.method == "OPTIONS":
         return cors({})
     return cors({"status": "alive"})
 
-@app.route("/", methods=["GET", "OPTIONS"])
-def home():
-    if request.method == "OPTIONS":
-        return cors({})
-    return cors({"status": "✅ Server is running"})
 
+# Фото (как у тебя было)
 @app.route("/generate", methods=["POST", "OPTIONS"])
 def generate():
     if request.method == "OPTIONS":
@@ -71,3 +69,58 @@ def generate():
     except Exception as e:
         logger.exception("Proxy failure")
         return cors({"error":f"Server error: {e}"}, 500)
+
+
+# Аудио (новое)
+@app.route("/analyze", methods=["POST", "OPTIONS"])
+def analyze():
+    if request.method == "OPTIONS":
+        return cors({})
+
+    if "file" not in request.files:
+        return cors({"error": "Audio file missing"}, 400)
+
+    audio_file = request.files["file"]
+
+    # 1. BirdNET API
+    try:
+        birdnet_url = "https://birdnet.cornell.edu/api/upload"
+        files = {"file": (audio_file.filename, audio_file, "audio/mpeg")}
+        r = requests.post(birdnet_url, files=files, timeout=60)
+        r.raise_for_status()
+        birdnet_json = r.json()
+    except Exception as e:
+        logger.exception("BirdNET request failed")
+        return cors({"error": f"BirdNET error: {e}"}, 502)
+
+    # 2. Gemini (красивое объяснение)
+    prompt = (
+        "Ты — эксперт по птицам. Вот результат анализа BirdNET:\n\n"
+        f"{birdnet_json}\n\n"
+        "Объясни простыми словами, какие птицы распознаны и с какой вероятностью."
+    )
+
+    payload = {
+        "contents": [{
+            "role": "user",
+            "parts": [{"text": prompt}]
+        }]
+    }
+
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/"
+        "models/gemini-2.5-flash:generateContent"
+        f"?key={GEMINI_API_KEY}"
+    )
+
+    try:
+        g = requests.post(url, json=payload, timeout=60)
+        g.raise_for_status()
+        text = (g.json()
+                 .get("candidates", [{}])[0]
+                 .get("content", {}).get("parts", [{}])[0]
+                 .get("text", ""))
+        return cors({"raw": birdnet_json, "summary": text})
+    except Exception as e:
+        logger.exception("Gemini request failed")
+        return cors({"error": f"Gemini error: {e}"}, 502)
