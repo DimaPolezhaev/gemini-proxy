@@ -1,4 +1,4 @@
-import os, logging, requests
+import os, logging, requests, json
 from flask import Flask, request, jsonify, make_response
 
 app = Flask(__name__)
@@ -15,7 +15,7 @@ def cors(payload, code=200):
     return resp
 
 
-# Пинг
+# --- Ping ---
 @app.route("/ping", methods=["GET", "OPTIONS"])
 def ping():
     if request.method == "OPTIONS":
@@ -23,7 +23,7 @@ def ping():
     return cors({"status": "alive"})
 
 
-# Фото (как у тебя было)
+# --- Фото ---
 @app.route("/generate", methods=["POST", "OPTIONS"])
 def generate():
     if request.method == "OPTIONS":
@@ -71,7 +71,7 @@ def generate():
         return cors({"error":f"Server error: {e}"}, 500)
 
 
-# Аудио (новое)
+# --- Аудио ---
 @app.route("/analyze", methods=["POST", "OPTIONS"])
 def analyze():
     if request.method == "OPTIONS":
@@ -85,7 +85,7 @@ def analyze():
     # 1. BirdNET API
     try:
         birdnet_url = "https://birdnet.cornell.edu/api/upload"
-        files = {"file": (audio_file.filename, audio_file, "audio/mpeg")}
+        files = {"file": (audio_file.filename, audio_file, audio_file.mimetype)}
         r = requests.post(birdnet_url, files=files, timeout=60)
         r.raise_for_status()
         birdnet_json = r.json()
@@ -93,10 +93,10 @@ def analyze():
         logger.exception("BirdNET request failed")
         return cors({"error": f"BirdNET error: {e}"}, 502)
 
-    # 2. Gemini (красивое объяснение)
+    # 2. Gemini (объяснение)
     prompt = (
         "Ты — эксперт по птицам. Вот результат анализа BirdNET:\n\n"
-        f"{birdnet_json}\n\n"
+        f"{json.dumps(birdnet_json, ensure_ascii=False)}\n\n"
         "Объясни простыми словами, какие птицы распознаны и с какой вероятностью."
     )
 
@@ -120,6 +120,8 @@ def analyze():
                  .get("candidates", [{}])[0]
                  .get("content", {}).get("parts", [{}])[0]
                  .get("text", ""))
+        if not text.strip():
+            return cors({"error": "Empty response from Gemini"}, 502)
         return cors({"raw": birdnet_json, "summary": text})
     except Exception as e:
         logger.exception("Gemini request failed")
