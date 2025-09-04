@@ -2,10 +2,6 @@ import os
 import logging
 import requests
 import json
-import sys
-import tempfile
-import subprocess
-import uuid
 from flask import Flask, request, jsonify, make_response
 
 app = Flask(__name__)
@@ -16,7 +12,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 def cors(payload, code=200):
     resp = make_response(jsonify(payload), code)
-    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Origin"]  = "*"
     resp.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
     resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
     return resp
@@ -49,12 +45,11 @@ def generate():
                 "role": "user",
                 "parts": [
                     {"text": prompt},
-                    {"inline_data": {"mime_type": "image/jpeg", "data": image_b64}}
+                    {"inline_data": {"mime_type":"image/jpeg","data":image_b64}}
                 ]
             }]
         }
 
-        # 🔧 Исправлено: убраны лишние пробелы в URL
         url = (
             "https://generativelanguage.googleapis.com/v1beta/"
             "models/gemini-2.5-flash:generateContent"
@@ -63,19 +58,16 @@ def generate():
 
         r = requests.post(url, json=payload, timeout=30)
         r.raise_for_status()
-        text = (
-            r.json()
-            .get("candidates", [{}])[0]
-            .get("content", {})
-            .get("parts", [{}])[0]
-            .get("text", "")
-        )
+        text = (r.json()
+                 .get("candidates", [{}])[0]
+                 .get("content", {}).get("parts", [{}])[0]
+                 .get("text", ""))
         if not text.strip():
             return cors({"error": "Empty response from Gemini"}, 502)
         return cors({"response": text})
     except Exception as e:
         logger.exception("Proxy failure (generate)")
-        return cors({"error": f"Server error: {e}"}, 500)
+        return cors({"error":f"Server error: {e}"}, 500)
 
 
 @app.route("/analyze", methods=["POST", "OPTIONS"])
@@ -87,51 +79,35 @@ def analyze():
         return cors({"error": "Audio file missing (field name must be 'file')"}, 400)
 
     audio_file = request.files["file"]
-    tmpdir = tempfile.mkdtemp()
-    input_path = os.path.join(tmpdir, f"{uuid.uuid4()}.wav")
-    audio_file.save(input_path)
-    output_path = os.path.join(tmpdir, "birdnet_output.json")
 
-    # --- BirdNET-Analyzer ---
+    # --- BirdNET ---
     try:
-        logger.info(f"Running BirdNET on {input_path}")
-
-        # ✅ Правильный вызов: использует __main__.py через -m birdnet_analyzer.analyze
-        result = subprocess.run([
-            sys.executable, "-m", "birdnet_analyzer.analyze",
-            input_path,              # позиционный аргумент INPUT
-            "-o", output_path,       # выходной путь
-            "--min_conf", "0.1",     # минимальная уверенность
-            "--threads", "1",        # меньше нагрузки на Vercel
-            "--rtype", "table",      # формат вывода
-            "--locale", "en"         # язык (по желанию)
-        ], capture_output=True, text=True)
-
-        logger.info("BirdNET stdout:\n" + result.stdout)
-        if result.stderr:
-            logger.error("BirdNET stderr:\n" + result.stderr)
-
-        if result.returncode != 0:
-            raise RuntimeError(f"BirdNET exited with code {result.returncode}")
-
-        # Убедимся, что файл создан
-        if not os.path.exists(output_path):
-            raise FileNotFoundError("BirdNET did not create output file")
-
-        with open(output_path, "r", encoding="utf-8") as f:
-            birdnet_json = json.load(f)
-
+        birdnet_url = "https://birdnet.cornell.edu/api/upload"
+        files = {"file": (
+            audio_file.filename or "audio.mp3",
+            audio_file.stream,
+            audio_file.mimetype or "application/octet-stream"
+        )}
+        r = requests.post(birdnet_url, files=files, timeout=60)
+        r.raise_for_status()
+        birdnet_json = r.json()
     except Exception as e:
-        logger.exception("BirdNET-Analyzer failed")
-        return cors({"error": f"BirdNET-Analyzer error: {str(e)}"}, 502)
+        logger.exception("BirdNET request failed")
+        return cors({"error": f"BirdNET error: {str(e)}"}, 502)
 
-    # --- Готовим сводку для Gemini ---
-    preds = birdnet_json.get("predictions", [])
-    if preds:
-        items = [f"{p.get('confidence', 0):.3f} — {p.get('species', '?')}" for p in preds[:5]]
-        top_summary = "Top predictions:\n" + "\n".join(items)
-    else:
-        top_summary = json.dumps(birdnet_json, ensure_ascii=False, indent=2)
+    # --- готовим сводку для Gemini ---
+    top_summary = ""
+    try:
+        preds = birdnet_json.get("prediction", {})
+        if preds:
+            items = []
+            for k, v in list(preds.items())[:5]:
+                items.append(f"{v.get('score',0):.3f} — {v.get('species')}")
+            top_summary = "Top predictions:\n" + "\n".join(items)
+        else:
+            top_summary = json.dumps(birdnet_json, ensure_ascii=False)
+    except Exception:
+        top_summary = json.dumps(birdnet_json, ensure_ascii=False)
 
     prompt = (
         "Ты — эксперт-орнитолог. Вот результат BirdNET:\n\n"
@@ -140,21 +116,25 @@ def analyze():
         "1) какая птица наиболее вероятна, 2) степень уверенности, 3) рекомендация."
     )
 
+    payload = {
+        "contents": [{
+            "role": "user",
+            "parts": [{"text": prompt}]
+        }]
+    }
+
     try:
         url = (
             "https://generativelanguage.googleapis.com/v1beta/"
             "models/gemini-2.5-flash:generateContent"
             f"?key={GEMINI_API_KEY}"
         )
-        g = requests.post(url, json={"contents": [{"role": "user", "parts": [{"text": prompt}]}]}, timeout=120)
+        g = requests.post(url, json=payload, timeout=60)
         g.raise_for_status()
-        text = (
-            g.json()
-            .get("candidates", [{}])[0]
-            .get("content", {})
-            .get("parts", [{}])[0]
-            .get("text", "")
-        )
+        text = (g.json()
+                 .get("candidates", [{}])[0]
+                 .get("content", {}).get("parts", [{}])[0]
+                 .get("text", ""))
         return cors({"raw": birdnet_json, "summary": text})
     except Exception as e:
         logger.exception("Gemini request failed")
@@ -165,10 +145,7 @@ def analyze():
 def home():
     if request.method == "OPTIONS":
         return cors({})
-    return cors({
-        "status": "✅ Server is running",
-        "endpoints": ["/ping", "/generate", "/analyze"]
-    })
+    return cors({"status": "✅ Server is running", "endpoints": ["/ping", "/generate", "/analyze"]})
 
 
 if __name__ == "__main__":
