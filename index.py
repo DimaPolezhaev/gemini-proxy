@@ -2,6 +2,8 @@ import os
 import logging
 import requests
 import json
+import sys
+import tempfile, subprocess, uuid
 from flask import Flask, request, jsonify, make_response
 
 app = Flask(__name__)
@@ -80,8 +82,6 @@ def analyze():
 
     audio_file = request.files["file"]
 
-    import tempfile, subprocess, uuid, os, json
-
     tmpdir = tempfile.mkdtemp()
     input_path = os.path.join(tmpdir, f"{uuid.uuid4()}.wav")
     audio_file.save(input_path)
@@ -90,11 +90,18 @@ def analyze():
 
     # --- BirdNET-Analyzer ---
     try:
-        subprocess.run([
-            "python", "-m", "birdnet_analyzer.analyze",
+        logger.info(f"Running BirdNET on {input_path}")
+        result = subprocess.run([
+            sys.executable, "-m", "birdnet_analyzer.analyze",
             "--i", input_path,
             "--o", output_path
-        ], check=True)
+        ], capture_output=True, text=True)
+
+        logger.info("BirdNET stdout:\n" + result.stdout)
+        logger.error("BirdNET stderr:\n" + result.stderr)
+
+        if result.returncode != 0:
+            raise RuntimeError(f"BirdNET exited with code {result.returncode}")
 
         with open(output_path, "r", encoding="utf-8") as f:
             birdnet_json = json.load(f)
@@ -104,15 +111,11 @@ def analyze():
         return cors({"error": f"BirdNET-Analyzer error: {str(e)}"}, 502)
 
     # --- готовим сводку для Gemini ---
-    top_summary = ""
-    try:
-        preds = birdnet_json.get("predictions", [])
-        if preds:
-            items = [f"{p.get('confidence',0):.3f} — {p.get('species','?')}" for p in preds[:5]]
-            top_summary = "Top predictions:\n" + "\n".join(items)
-        else:
-            top_summary = json.dumps(birdnet_json, ensure_ascii=False)
-    except Exception:
+    preds = birdnet_json.get("predictions", [])
+    if preds:
+        items = [f"{p.get('confidence',0):.3f} — {p.get('species','?')}" for p in preds[:5]]
+        top_summary = "Top predictions:\n" + "\n".join(items)
+    else:
         top_summary = json.dumps(birdnet_json, ensure_ascii=False)
 
     prompt = (
@@ -122,20 +125,14 @@ def analyze():
         "1) какая птица наиболее вероятна, 2) степень уверенности, 3) рекомендация."
     )
 
-    payload = {
-        "contents": [{
-            "role": "user",
-            "parts": [{"text": prompt}]
-        }]
-    }
-
+    payload = {"contents": [{"role":"user","parts":[{"text": prompt}]}]}
     try:
         url = (
             "https://generativelanguage.googleapis.com/v1beta/"
             "models/gemini-2.5-flash:generateContent"
             f"?key={GEMINI_API_KEY}"
         )
-        g = requests.post(url, json=payload, timeout=60)
+        g = requests.post(url, json=payload, timeout=120)
         g.raise_for_status()
         text = (g.json()
                  .get("candidates", [{}])[0]
