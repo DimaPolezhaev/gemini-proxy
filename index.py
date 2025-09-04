@@ -80,29 +80,35 @@ def analyze():
 
     audio_file = request.files["file"]
 
-    # --- BirdNET ---
+    import tempfile, subprocess, uuid, os, json
+
+    tmpdir = tempfile.mkdtemp()
+    input_path = os.path.join(tmpdir, f"{uuid.uuid4()}.wav")
+    audio_file.save(input_path)
+
+    output_path = os.path.join(tmpdir, "birdnet_output.json")
+
+    # --- BirdNET-Analyzer ---
     try:
-        birdnet_url = "https://birdnet.cornell.edu/api/upload"
-        files = {"file": (
-            audio_file.filename or "audio.mp3",
-            audio_file.stream,
-            audio_file.mimetype or "application/octet-stream"
-        )}
-        r = requests.post(birdnet_url, files=files, timeout=60)
-        r.raise_for_status()
-        birdnet_json = r.json()
+        subprocess.run([
+            "python", "-m", "birdnet_analyzer.analyze",
+            "--i", input_path,
+            "--o", output_path
+        ], check=True)
+
+        with open(output_path, "r", encoding="utf-8") as f:
+            birdnet_json = json.load(f)
+
     except Exception as e:
-        logger.exception("BirdNET request failed")
-        return cors({"error": f"BirdNET error: {str(e)}"}, 502)
+        logger.exception("BirdNET-Analyzer failed")
+        return cors({"error": f"BirdNET-Analyzer error: {str(e)}"}, 502)
 
     # --- готовим сводку для Gemini ---
     top_summary = ""
     try:
-        preds = birdnet_json.get("prediction", {})
+        preds = birdnet_json.get("predictions", [])
         if preds:
-            items = []
-            for k, v in list(preds.items())[:5]:
-                items.append(f"{v.get('score',0):.3f} — {v.get('species')}")
+            items = [f"{p.get('confidence',0):.3f} — {p.get('species','?')}" for p in preds[:5]]
             top_summary = "Top predictions:\n" + "\n".join(items)
         else:
             top_summary = json.dumps(birdnet_json, ensure_ascii=False)
@@ -139,7 +145,6 @@ def analyze():
     except Exception as e:
         logger.exception("Gemini request failed")
         return cors({"error": f"Gemini error: {str(e)}"}, 502)
-
 
 @app.route("/", methods=["GET", "OPTIONS"])
 def home():
