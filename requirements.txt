@@ -1,3 +1,5 @@
 Flask==3.0.3
 requests==2.32.3
 werkzeug==3.0.4
+
+-e ./BirdNET-Analyzer
