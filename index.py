@@ -6,6 +6,9 @@ import sys
 import tempfile, subprocess, uuid
 from flask import Flask, request, jsonify, make_response
 
+# путь к папке BirdNET-Analyzer
+sys.path.append(os.path.join(os.path.dirname(__file__), "BirdNET-Analyzer"))
+
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
