@@ -1,6 +1,5 @@
-import os, logging, requests, base64, tempfile
+import os, logging, requests
 from flask import Flask, request, jsonify, make_response
-import io
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -27,7 +26,7 @@ def home():
         return cors({})
     return cors({"status": "✅ Server is running"})
 
-# Эндпоинт для анализа изображений
+# --- Эндпоинт для анализа изображений ---
 @app.route("/generate", methods=["POST", "OPTIONS"])
 def generate_image():
     if request.method == "OPTIONS":
@@ -47,7 +46,7 @@ def generate_image():
             "role": "user",
             "parts": [
                 {"text": prompt},
-                {"inline_data": {"mime_type":"image/jpeg","data":image_b64}}
+                {"inline_data": {"mime_type": "image/jpeg", "data": image_b64}}
             ]
         }]
     }
@@ -69,12 +68,12 @@ def generate_image():
             return cors({"error": "Empty response"}, 502)
         return cors({"response": text})
     except requests.exceptions.HTTPError as e:
-        return cors({"error":"Gemini API error","details":str(e)}, r.status_code)
+        return cors({"error": "Gemini API error", "details": str(e)}, r.status_code)
     except Exception as e:
-        logger.exception("Proxy failure")
-        return cors({"error":f"Server error: {e}"}, 500)
+        logger.exception("Proxy failure (image)")
+        return cors({"error": f"Server error: {e}"}, 500)
 
-# Эндпоинт для анализа аудио (упрощенная версия без pydub)
+# --- Эндпоинт для обработки текста из BirdNET ---
 @app.route("/analyze-audio", methods=["POST", "OPTIONS"])
 def analyze_audio():
     if request.method == "OPTIONS":
@@ -82,18 +81,16 @@ def analyze_audio():
 
     data = request.get_json(silent=True) or {}
     prompt = data.get("prompt")
-    audio_b64 = data.get("audio_base64")
+    birdnet_result = data.get("birdnet_result")  # текстовый результат от BirdNET
 
-    if not prompt or not audio_b64:
-        return cors({"error": "Prompt or audio not provided"}, 400)
+    if not prompt or not birdnet_result:
+        return cors({"error": "Prompt or birdnet_result not provided"}, 400)
 
-    # Отправляем аудио в Gemini как есть (без конвертации)
     payload = {
         "contents": [{
             "role": "user",
             "parts": [
-                {"text": prompt},
-                {"inline_data": {"mime_type": "audio/mp4", "data": audio_b64}}
+                {"text": f"{prompt}\n\nРезультаты BirdNET:\n{birdnet_result}"}
             ]
         }]
     }
@@ -105,7 +102,7 @@ def analyze_audio():
     )
 
     try:
-        r = requests.post(url, json=payload, timeout=60)
+        r = requests.post(url, json=payload, timeout=30)
         r.raise_for_status()
         text = (r.json()
                  .get("candidates", [{}])[0]
@@ -115,9 +112,9 @@ def analyze_audio():
             return cors({"error": "Empty response"}, 502)
         return cors({"response": text})
     except Exception as e:
-        logger.exception("Audio analysis error")
+        logger.exception("Proxy failure (audio text)")
         return cors({"error": f"Server error: {e}"}, 500)
 
-# Для Vercel
+# Для локального запуска
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
