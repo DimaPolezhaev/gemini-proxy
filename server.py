@@ -73,7 +73,7 @@ def generate_image():
         logger.exception("Proxy failure (image)")
         return cors({"error": f"Server error: {e}"}, 500)
 
-# --- Эндпоинт для обработки текста из BirdNET ---
+# --- Эндпоинт для анализа BirdNET результатов (ТОЛЬКО ТЕКСТ) ---
 @app.route("/analyze-audio", methods=["POST", "OPTIONS"])
 def analyze_audio():
     if request.method == "OPTIONS":
@@ -81,17 +81,20 @@ def analyze_audio():
 
     data = request.get_json(silent=True) or {}
     prompt = data.get("prompt")
-    birdnet_result = data.get("birdnet_result")  # текстовый результат от BirdNET
+    birdnet_results = data.get("birdnet_results")
 
-    if not prompt or not birdnet_result:
-        return cors({"error": "Prompt or birdnet_result not provided"}, 400)
+    if not prompt:
+        return cors({"error": "Prompt not provided"}, 400)
+    if not birdnet_results:
+        return cors({"error": "BirdNET results not provided"}, 400)
+
+    # Объединяем промпт с результатами BirdNET
+    final_prompt = f"{prompt}\n\nРезультаты анализа BirdNET:\n{birdnet_results}"
 
     payload = {
         "contents": [{
             "role": "user",
-            "parts": [
-                {"text": f"{prompt}\n\nРезультаты BirdNET:\n{birdnet_result}"}
-            ]
+            "parts": [{"text": final_prompt}]
         }]
     }
 
@@ -111,8 +114,11 @@ def analyze_audio():
         if not text.strip():
             return cors({"error": "Empty response"}, 502)
         return cors({"response": text})
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"Gemini API error: {e}")
+        return cors({"error": "Gemini API error", "details": str(e)}, r.status_code if hasattr(r, 'status_code') else 500)
     except Exception as e:
-        logger.exception("Proxy failure (audio text)")
+        logger.exception("Proxy failure (audio analysis)")
         return cors({"error": f"Server error: {e}"}, 500)
 
 # Для локального запуска
