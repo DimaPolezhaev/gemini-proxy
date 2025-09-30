@@ -1,6 +1,5 @@
 import os, logging, requests, base64, tempfile
 from flask import Flask, request, jsonify, make_response
-from pydub import AudioSegment
 import io
 
 app = Flask(__name__)
@@ -11,37 +10,10 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 def cors(payload, code=200):
     resp = make_response(jsonify(payload), code)
-    resp.headers["Access-Control-Allow-Origin"]  = "*"
+    resp.headers["Access-Control-Allow-Origin"] = "*"
     resp.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
     resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
     return resp
-
-def convert_audio_to_wav(audio_b64):
-    """Конвертирует аудио в WAV формат"""
-    try:
-        audio_data = base64.b64decode(audio_b64)
-        
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as temp_file:
-            # Автоматическое определение формата
-            audio = AudioSegment.from_file(io.BytesIO(audio_data))
-            
-            # Конвертируем в моно, 16kHz
-            audio = audio.set_channels(1)
-            audio = audio.set_frame_rate(16000)
-            
-            # Экспортируем в WAV
-            audio.export(temp_file.name, format="wav")
-            
-            with open(temp_file.name, 'rb') as f:
-                wav_data = f.read()
-            
-            os.unlink(temp_file.name)
-            
-            return base64.b64encode(wav_data).decode('utf-8')
-            
-    except Exception as e:
-        logger.error(f"Audio conversion error: {e}")
-        return None
 
 @app.route("/ping", methods=["GET", "OPTIONS"])
 def ping():
@@ -102,7 +74,7 @@ def generate_image():
         logger.exception("Proxy failure")
         return cors({"error":f"Server error: {e}"}, 500)
 
-# Эндпоинт для анализа аудио
+# Эндпоинт для анализа аудио (упрощенная версия без pydub)
 @app.route("/analyze-audio", methods=["POST", "OPTIONS"])
 def analyze_audio():
     if request.method == "OPTIONS":
@@ -115,18 +87,13 @@ def analyze_audio():
     if not prompt or not audio_b64:
         return cors({"error": "Prompt or audio not provided"}, 400)
 
-    # Конвертируем аудио в WAV
-    processed_audio_b64 = convert_audio_to_wav(audio_b64)
-    if not processed_audio_b64:
-        return cors({"error": "Audio conversion failed"}, 400)
-
-    # Отправляем аудио в Gemini
+    # Отправляем аудио в Gemini как есть (без конвертации)
     payload = {
         "contents": [{
             "role": "user",
             "parts": [
                 {"text": prompt},
-                {"inline_data": {"mime_type": "audio/wav", "data": processed_audio_b64}}
+                {"inline_data": {"mime_type": "audio/mp4", "data": audio_b64}}
             ]
         }]
     }
@@ -151,5 +118,6 @@ def analyze_audio():
         logger.exception("Audio analysis error")
         return cors({"error": f"Server error: {e}"}, 500)
 
+# Для Vercel
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
