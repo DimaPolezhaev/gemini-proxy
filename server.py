@@ -39,12 +39,12 @@ def home():
 # --- Скачивание ffmpeg ---
 def ensure_ffmpeg():
     ffmpeg_dir = os.path.join(tempfile.gettempdir(), "ffmpeg")
+    os.makedirs(ffmpeg_dir, exist_ok=True)
+
     ffmpeg_path = os.path.join(ffmpeg_dir, "ffmpeg")
     ffprobe_path = os.path.join(ffmpeg_dir, "ffprobe")
 
     if not os.path.exists(ffmpeg_path) or not os.path.exists(ffprobe_path):
-        os.makedirs(ffmpeg_dir, exist_ok=True)
-        logger.info("Downloading ffmpeg for Vercel...")
         url = "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz"
         r = requests.get(url)
         r.raise_for_status()
@@ -52,6 +52,7 @@ def ensure_ffmpeg():
         with open(archive_path, "wb") as f:
             f.write(r.content)
 
+        import tarfile
         with tarfile.open(archive_path, "r:xz") as tar:
             tar.extractall(path=ffmpeg_dir)
 
@@ -59,8 +60,13 @@ def ensure_ffmpeg():
             os.path.join(ffmpeg_dir, d) for d in os.listdir(ffmpeg_dir)
             if os.path.isdir(os.path.join(ffmpeg_dir, d))
         )
+
         os.rename(os.path.join(extracted_dir, "ffmpeg"), ffmpeg_path)
         os.rename(os.path.join(extracted_dir, "ffprobe"), ffprobe_path)
+
+        # Важно: сделать исполняемыми
+        os.chmod(ffmpeg_path, 0o755)
+        os.chmod(ffprobe_path, 0o755)
 
     AudioSegment.converter = ffmpeg_path
     AudioSegment.ffprobe = ffprobe_path
