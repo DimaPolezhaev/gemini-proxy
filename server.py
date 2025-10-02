@@ -7,6 +7,7 @@ import io
 from flask import Flask, request, jsonify, make_response
 from pydub import AudioSegment
 import tarfile
+import stat
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -36,9 +37,8 @@ def home():
         return cors({})
     return cors({"status": "✅ Server is running"})
 
-# --- Скачивание ffmpeg ---
+# --- Скачивание ffmpeg/ffprobe для Vercel ---
 def ensure_ffmpeg():
-    import stat
     ffmpeg_dir = "/tmp/ffmpeg"
     os.makedirs(ffmpeg_dir, exist_ok=True)
 
@@ -53,11 +53,10 @@ def ensure_ffmpeg():
         with open(archive_path, "wb") as f:
             f.write(r.content)
 
-        import tarfile
         with tarfile.open(archive_path, "r:xz") as tar:
             tar.extractall(path=ffmpeg_dir)
 
-        # В распакованной папке бинарники
+        # Найти распакованную папку с бинарниками
         extracted_dir = next(
             os.path.join(ffmpeg_dir, d) for d in os.listdir(ffmpeg_dir)
             if os.path.isdir(os.path.join(ffmpeg_dir, d))
@@ -70,11 +69,13 @@ def ensure_ffmpeg():
         os.chmod(ffmpeg_path, stat.S_IRWXU)
         os.chmod(ffprobe_path, stat.S_IRWXU)
 
-    # Указать pydub использовать именно эти бинарники
+    # Указать pydub использовать эти бинарники
     AudioSegment.converter = ffmpeg_path
     AudioSegment.ffprobe = ffprobe_path
-    logger.info(f"ffmpeg ready: {ffmpeg_path}")
 
+    # Добавить в PATH, чтобы pydub точно нашел
+    os.environ["PATH"] += os.pathsep + ffmpeg_dir
+    logger.info(f"ffmpeg ready: {ffmpeg_path}, ffprobe ready: {ffprobe_path}")
 
 # --- Инициализация ffmpeg ---
 ensure_ffmpeg()
@@ -132,13 +133,13 @@ def generate_image():
         return cors({"error": "Image too large"}, 413)
 
     payload = {
-        "contents": [ {
+        "contents": [{
             "role": "user",
             "parts": [
                 {"text": prompt},
                 {"inline_data": {"mime_type": "image/jpeg", "data": image_b64}}
             ]
-        } ]
+        }]
     }
 
     url = (
@@ -179,7 +180,7 @@ def analyze_audio():
         return cors({"error": "BirdNET results not provided"}, 400)
 
     final_prompt = f"{prompt}\n\nРезультаты анализа BirdNET:\n{birdnet_results}"
-    payload = { "contents": [ { "role": "user", "parts": [{"text": final_prompt}]} ] }
+    payload = {"contents": [{"role": "user", "parts": [{"text": final_prompt}]}]}
 
     url = (
         "https://generativelanguage.googleapis.com/v1beta/"
