@@ -38,7 +38,8 @@ def home():
 
 # --- Скачивание ffmpeg ---
 def ensure_ffmpeg():
-    ffmpeg_dir = os.path.join(tempfile.gettempdir(), "ffmpeg")
+    import stat
+    ffmpeg_dir = "/tmp/ffmpeg"
     os.makedirs(ffmpeg_dir, exist_ok=True)
 
     ffmpeg_path = os.path.join(ffmpeg_dir, "ffmpeg")
@@ -56,6 +57,7 @@ def ensure_ffmpeg():
         with tarfile.open(archive_path, "r:xz") as tar:
             tar.extractall(path=ffmpeg_dir)
 
+        # В распакованной папке бинарники
         extracted_dir = next(
             os.path.join(ffmpeg_dir, d) for d in os.listdir(ffmpeg_dir)
             if os.path.isdir(os.path.join(ffmpeg_dir, d))
@@ -64,13 +66,15 @@ def ensure_ffmpeg():
         os.rename(os.path.join(extracted_dir, "ffmpeg"), ffmpeg_path)
         os.rename(os.path.join(extracted_dir, "ffprobe"), ffprobe_path)
 
-        # Важно: сделать исполняемыми
-        os.chmod(ffmpeg_path, 0o755)
-        os.chmod(ffprobe_path, 0o755)
+        # Сделать бинарники исполняемыми
+        os.chmod(ffmpeg_path, stat.S_IRWXU)
+        os.chmod(ffprobe_path, stat.S_IRWXU)
 
+    # Указать pydub использовать именно эти бинарники
     AudioSegment.converter = ffmpeg_path
     AudioSegment.ffprobe = ffprobe_path
     logger.info(f"ffmpeg ready: {ffmpeg_path}")
+
 
 # --- Инициализация ffmpeg ---
 ensure_ffmpeg()
