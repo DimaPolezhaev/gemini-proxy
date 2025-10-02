@@ -1,5 +1,11 @@
 import os, logging, requests
 from flask import Flask, request, jsonify, make_response
+import base64
+import tempfile
+from pathlib import Path
+import subprocess
+from pydub import AudioSegment
+import io
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -25,6 +31,48 @@ def home():
     if request.method == "OPTIONS":
         return cors({})
     return cors({"status": "✅ Server is running"})
+
+# --- Эндпоинт для конвертации аудио в WAV ---
+@app.route("/convert-audio", methods=["POST", "OPTIONS"])
+def convert_audio():
+    if request.method == "OPTIONS":
+        return cors({})
+
+    try:
+        data = request.get_json(silent=True) or {}
+        audio_data = data.get("audio_data")
+        
+        if not audio_data:
+            return cors({"error": "Audio data not provided"}, 400)
+
+        # Декодируем аудио
+        audio_bytes = base64.b64decode(audio_data)
+        
+        # Загружаем аудио через pydub
+        audio = AudioSegment.from_file(io.BytesIO(audio_bytes))
+        
+        # Конвертируем в нужный формат: 48000Hz, моно, 16-bit
+        audio = audio.set_frame_rate(48000).set_channels(1).set_sample_width(2)
+        
+        # Экспортируем в WAV
+        wav_buffer = io.BytesIO()
+        audio.export(wav_buffer, format="wav")
+        wav_bytes = wav_buffer.getvalue()
+        
+        # Кодируем обратно в base64
+        wav_base64 = base64.b64encode(wav_bytes).decode('utf-8')
+        
+        logger.info(f"Audio converted successfully: {len(wav_bytes)} bytes")
+        
+        return cors({
+            "success": True,
+            "wav_data": wav_base64,
+            "message": "Audio converted successfully"
+        })
+        
+    except Exception as e:
+        logger.exception("Audio conversion error")
+        return cors({"error": f"Conversion failed: {str(e)}"}, 500)
 
 # --- Эндпоинт для анализа изображений ---
 @app.route("/generate", methods=["POST", "OPTIONS"])
