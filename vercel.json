@@ -2,14 +2,15 @@
   "version": 2,
   "builds": [
     {
-      "src": "server.py",
+      "src": "*.py",
       "use": "@vercel/python"
     }
   ],
   "routes": [
     {
       "src": "/(.*)",
-      "dest": "server.py"
+      "dest": "/index.py"
     }
-  ]
+  ],
+  "installCommand": "apt-get update && apt-get install -y ffmpeg && pip install -r requirements.txt"
 }
