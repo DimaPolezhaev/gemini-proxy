@@ -1,11 +1,12 @@
-import os, logging, requests
-from flask import Flask, request, jsonify, make_response
+import os
+import logging
+import requests
 import base64
 import tempfile
-from pathlib import Path
-import subprocess
-from pydub import AudioSegment
 import io
+from flask import Flask, request, jsonify, make_response
+from pydub import AudioSegment
+import tarfile
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -13,6 +14,7 @@ logger = logging.getLogger(__name__)
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
+# --- CORS helper ---
 def cors(payload, code=200):
     resp = make_response(jsonify(payload), code)
     resp.headers["Access-Control-Allow-Origin"] = "*"
@@ -20,17 +22,52 @@ def cors(payload, code=200):
     resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
     return resp
 
+# --- Пинг ---
 @app.route("/ping", methods=["GET", "OPTIONS"])
 def ping():
     if request.method == "OPTIONS":
         return cors({})
     return cors({"status": "alive"})
 
+# --- Главная страница ---
 @app.route("/", methods=["GET", "OPTIONS"])
 def home():
     if request.method == "OPTIONS":
         return cors({})
     return cors({"status": "✅ Server is running"})
+
+# --- Скачивание ffmpeg ---
+def ensure_ffmpeg():
+    ffmpeg_dir = os.path.join(tempfile.gettempdir(), "ffmpeg")
+    ffmpeg_path = os.path.join(ffmpeg_dir, "ffmpeg")
+    ffprobe_path = os.path.join(ffmpeg_dir, "ffprobe")
+
+    if not os.path.exists(ffmpeg_path) or not os.path.exists(ffprobe_path):
+        os.makedirs(ffmpeg_dir, exist_ok=True)
+        logger.info("Downloading ffmpeg for Vercel...")
+        url = "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz"
+        r = requests.get(url)
+        r.raise_for_status()
+        archive_path = os.path.join(ffmpeg_dir, "ffmpeg.tar.xz")
+        with open(archive_path, "wb") as f:
+            f.write(r.content)
+
+        with tarfile.open(archive_path, "r:xz") as tar:
+            tar.extractall(path=ffmpeg_dir)
+
+        extracted_dir = next(
+            os.path.join(ffmpeg_dir, d) for d in os.listdir(ffmpeg_dir)
+            if os.path.isdir(os.path.join(ffmpeg_dir, d))
+        )
+        os.rename(os.path.join(extracted_dir, "ffmpeg"), ffmpeg_path)
+        os.rename(os.path.join(extracted_dir, "ffprobe"), ffprobe_path)
+
+    AudioSegment.converter = ffmpeg_path
+    AudioSegment.ffprobe = ffprobe_path
+    logger.info(f"ffmpeg ready: {ffmpeg_path}")
+
+# --- Инициализация ffmpeg ---
+ensure_ffmpeg()
 
 # --- Эндпоинт для конвертации аудио в WAV ---
 @app.route("/convert-audio", methods=["POST", "OPTIONS"])
@@ -41,40 +78,35 @@ def convert_audio():
     try:
         data = request.get_json(silent=True) or {}
         audio_data = data.get("audio_data")
-        
+
         if not audio_data:
             return cors({"error": "Audio data not provided"}, 400)
 
-        # Декодируем аудио
+        if len(audio_data) > 10_000_000:
+            return cors({"error": "Audio too large"}, 413)
+
         audio_bytes = base64.b64decode(audio_data)
-        
-        # Загружаем аудио через pydub
-        audio = AudioSegment.from_file(io.BytesIO(audio_bytes))
-        
-        # Конвертируем в нужный формат: 48000Hz, моно, 16-bit
+        audio_file = io.BytesIO(audio_bytes)
+        audio = AudioSegment.from_file(audio_file)
         audio = audio.set_frame_rate(48000).set_channels(1).set_sample_width(2)
-        
-        # Экспортируем в WAV
+
         wav_buffer = io.BytesIO()
         audio.export(wav_buffer, format="wav")
         wav_bytes = wav_buffer.getvalue()
-        
-        # Кодируем обратно в base64
-        wav_base64 = base64.b64encode(wav_bytes).decode('utf-8')
-        
+        wav_base64 = base64.b64encode(wav_bytes).decode("utf-8")
+
         logger.info(f"Audio converted successfully: {len(wav_bytes)} bytes")
-        
         return cors({
             "success": True,
             "wav_data": wav_base64,
             "message": "Audio converted successfully"
         })
-        
+
     except Exception as e:
         logger.exception("Audio conversion error")
         return cors({"error": f"Conversion failed: {str(e)}"}, 500)
 
-# --- Эндпоинт для анализа изображений ---
+# --- Эндпоинт генерации изображений через Gemini ---
 @app.route("/generate", methods=["POST", "OPTIONS"])
 def generate_image():
     if request.method == "OPTIONS":
@@ -90,13 +122,13 @@ def generate_image():
         return cors({"error": "Image too large"}, 413)
 
     payload = {
-        "contents": [{
+        "contents": [ {
             "role": "user",
             "parts": [
                 {"text": prompt},
                 {"inline_data": {"mime_type": "image/jpeg", "data": image_b64}}
             ]
-        }]
+        } ]
     }
 
     url = (
@@ -121,7 +153,7 @@ def generate_image():
         logger.exception("Proxy failure (image)")
         return cors({"error": f"Server error: {e}"}, 500)
 
-# --- Эндпоинт для анализа BirdNET результатов (ТОЛЬКО ТЕКСТ) ---
+# --- Эндпоинт анализа BirdNET (только текст) ---
 @app.route("/analyze-audio", methods=["POST", "OPTIONS"])
 def analyze_audio():
     if request.method == "OPTIONS":
@@ -136,15 +168,8 @@ def analyze_audio():
     if not birdnet_results:
         return cors({"error": "BirdNET results not provided"}, 400)
 
-    # Объединяем промпт с результатами BirdNET
     final_prompt = f"{prompt}\n\nРезультаты анализа BirdNET:\n{birdnet_results}"
-
-    payload = {
-        "contents": [{
-            "role": "user",
-            "parts": [{"text": final_prompt}]
-        }]
-    }
+    payload = { "contents": [ { "role": "user", "parts": [{"text": final_prompt}]} ] }
 
     url = (
         "https://generativelanguage.googleapis.com/v1beta/"
@@ -169,6 +194,6 @@ def analyze_audio():
         logger.exception("Proxy failure (audio analysis)")
         return cors({"error": f"Server error: {e}"}, 500)
 
-# Для локального запуска
+# --- Локальный запуск ---
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
