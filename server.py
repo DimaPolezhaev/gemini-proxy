@@ -9,6 +9,7 @@ from pydub import AudioSegment
 import tarfile
 import stat
 import time
+import subprocess
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -18,8 +19,6 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 # Глобальные переменные для кэширования
 _ffmpeg_initialized = False
-_ffmpeg_path = None
-_ffprobe_path = None
 
 def cors(payload, code=200):
     resp = make_response(jsonify(payload), code)
@@ -29,7 +28,7 @@ def cors(payload, code=200):
     return resp
 
 def ensure_ffmpeg():
-    global _ffmpeg_initialized, _ffmpeg_path, _ffprobe_path
+    global _ffmpeg_initialized
     
     if _ffmpeg_initialized:
         return True
@@ -40,64 +39,54 @@ def ensure_ffmpeg():
     ffmpeg_dir = "/tmp/ffmpeg"
     os.makedirs(ffmpeg_dir, exist_ok=True)
 
-    _ffmpeg_path = os.path.join(ffmpeg_dir, "ffmpeg")
-    _ffprobe_path = os.path.join(ffmpeg_dir, "ffprobe")
+    ffmpeg_path = os.path.join(ffmpeg_dir, "ffmpeg")
+    ffprobe_path = os.path.join(ffmpeg_dir, "ffprobe")
 
-    # Проверяем, существуют ли уже бинарники
-    if os.path.exists(_ffmpeg_path) and os.path.exists(_ffprobe_path):
-        logger.info("✅ FFmpeg binaries already exist, reusing...")
-    else:
-        try:
-            logger.info("📥 Downloading FFmpeg...")
-            # Используем более быстрый источник
-            url = "https://github.com/eugeneware/ffmpeg-static/releases/download/b5.0.1/linux-x64"
-            response = requests.get(url, timeout=120, stream=True)
-            response.raise_for_status()
-            
-            # Сохраняем ffmpeg
-            with open(_ffmpeg_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    f.write(chunk)
-            
-            # Создаем симлинк для ffprobe (используем тот же бинарник)
-            os.symlink(_ffmpeg_path, _ffprobe_path)
-            
-            # Делаем исполняемыми
-            os.chmod(_ffmpeg_path, stat.S_IRWXU)
-            os.chmod(_ffprobe_path, stat.S_IRWXU)
-            
-            logger.info("✅ FFmpeg downloaded and configured successfully")
-            
-        except Exception as e:
-            logger.error(f"❌ Failed to download FFmpeg: {e}")
-            # Создаем заглушки чтобы не падать
-            with open(_ffmpeg_path, "wb") as f:
-                f.write(b"#!/bin/bash\necho 'FFmpeg not available'")
-            with open(_ffprobe_path, "wb") as f:
-                f.write(b"#!/bin/bash\necho 'FFprobe not available'")
-            os.chmod(_ffmpeg_path, stat.S_IRWXU)
-            os.chmod(_ffprobe_path, stat.S_IRWXU)
-
-    # Настраиваем pydub
+    # Используем готовые бинарники из нашего проекта
     try:
-        AudioSegment.converter = _ffmpeg_path
-        AudioSegment.ffprobe = _ffprobe_path
-        os.environ["PATH"] = ffmpeg_dir + os.pathsep + os.environ.get("PATH", "")
+        # Скачиваем готовые статические бинарники
+        logger.info("📥 Downloading pre-built FFmpeg...")
         
-        # Тестируем ffmpeg
-        test_result = os.system(f"{_ffmpeg_path} -version > /dev/null 2>&1")
-        if test_result == 0:
-            logger.info(f"✅ FFmpeg initialized successfully in {time.time() - start_time:.2f}s")
+        # FFmpeg binary
+        ffmpeg_url = "https://github.com/eugeneware/ffmpeg-static/releases/download/b5.0.1/linux-x64"
+        response = requests.get(ffmpeg_url, timeout=30)
+        response.raise_for_status()
+        
+        with open(ffmpeg_path, "wb") as f:
+            f.write(response.content)
+        
+        # FFprobe - создаем симлинк
+        os.symlink(ffmpeg_path, ffprobe_path)
+        
+        # Делаем исполняемыми
+        os.chmod(ffmpeg_path, 0o755)
+        os.chmod(ffprobe_path, 0o755)
+        
+        # Проверяем работоспособность
+        result = subprocess.run(
+            [ffmpeg_path, "-version"], 
+            capture_output=True, 
+            text=True, 
+            timeout=10
+        )
+        
+        if result.returncode == 0:
+            logger.info(f"✅ FFmpeg initialized successfully: {result.stdout.split()[2]}")
+            
+            # Настраиваем pydub
+            AudioSegment.converter = ffmpeg_path
+            AudioSegment.ffprobe = ffprobe_path
+            os.environ["PATH"] = ffmpeg_dir + os.pathsep + os.environ.get("PATH", "")
+            
             _ffmpeg_initialized = True
+            logger.info(f"🚀 FFmpeg ready in {time.time() - start_time:.2f}s")
             return True
         else:
-            logger.warning("⚠️ FFmpeg test failed, audio conversion may not work")
-            _ffmpeg_initialized = True
+            logger.error("❌ FFmpeg test failed")
             return False
             
     except Exception as e:
-        logger.error(f"❌ FFmpeg configuration failed: {e}")
-        _ffmpeg_initialized = True
+        logger.error(f"❌ FFmpeg initialization failed: {e}")
         return False
 
 # --- Пинг ---
@@ -112,9 +101,11 @@ def ping():
 def home():
     if request.method == "OPTIONS":
         return cors({})
+    
+    ffmpeg_status = "ready" if _ffmpeg_initialized else "not_initialized"
     return cors({
         "status": "✅ Server is running", 
-        "ffmpeg_ready": _ffmpeg_initialized,
+        "ffmpeg": ffmpeg_status,
         "timestamp": time.time()
     })
 
@@ -126,48 +117,60 @@ def convert_audio():
 
     try:
         # Ленивая инициализация ffmpeg
-        ffmpeg_ready = ensure_ffmpeg()
-        if not ffmpeg_ready:
+        if not ensure_ffmpeg():
             return cors({
-                "error": "FFmpeg not available", 
-                "message": "Audio conversion temporarily unavailable"
+                "error": "FFmpeg initialization failed", 
+                "message": "Audio conversion unavailable"
             }, 503)
 
         data = request.get_json(silent=True) or {}
         audio_data = data.get("audio_data")
+        filename = data.get("filename", "audio")
 
         if not audio_data:
             return cors({"error": "Audio data not provided"}, 400)
 
         # Проверка размера
-        if len(audio_data) > 10_000_000:  # ~10MB
-            return cors({"error": "Audio file too large (max 10MB)"}, 413)
+        if len(audio_data) > 8_000_000:  # ~8MB
+            return cors({"error": "Audio file too large (max 8MB)"}, 413)
 
-        logger.info(f"🔄 Converting audio, size: {len(audio_data)} bytes")
+        logger.info(f"🔄 Converting audio: {filename}, size: {len(audio_data)} bytes")
         
         # Декодируем base64
         audio_bytes = base64.b64decode(audio_data)
         
-        # Определяем формат по расширению или заголовкам
-        audio_file = io.BytesIO(audio_bytes)
-        
-        # Конвертируем в WAV
-        audio = AudioSegment.from_file(audio_file)
-        audio = audio.set_frame_rate(48000).set_channels(1).set_sample_width(2)
+        # Сохраняем во временный файл
+        with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{filename}") as temp_input:
+            temp_input.write(audio_bytes)
+            temp_input_path = temp_input.name
 
-        wav_buffer = io.BytesIO()
-        audio.export(wav_buffer, format="wav")
-        wav_bytes = wav_buffer.getvalue()
-        wav_base64 = base64.b64encode(wav_bytes).decode("utf-8")
+        try:
+            # Определяем формат файла
+            audio_file = io.BytesIO(audio_bytes)
+            
+            # Конвертируем в WAV с помощью pydub
+            audio = AudioSegment.from_file(audio_file)
+            audio = audio.set_frame_rate(48000).set_channels(1).set_sample_width(2)
 
-        logger.info(f"✅ Audio converted successfully: {len(wav_bytes)} bytes")
-        return cors({
-            "success": True,
-            "wav_data": wav_base64,
-            "original_size": len(audio_bytes),
-            "converted_size": len(wav_bytes),
-            "message": "Audio converted to WAV successfully"
-        })
+            wav_buffer = io.BytesIO()
+            audio.export(wav_buffer, format="wav")
+            wav_bytes = wav_buffer.getvalue()
+            wav_base64 = base64.b64encode(wav_bytes).decode("utf-8")
+
+            logger.info(f"✅ Audio converted successfully: {len(wav_bytes)} bytes")
+            
+            return cors({
+                "success": True,
+                "wav_data": wav_base64,
+                "original_size": len(audio_bytes),
+                "converted_size": len(wav_bytes),
+                "message": "Audio converted to WAV successfully"
+            })
+            
+        finally:
+            # Очищаем временные файлы
+            if os.path.exists(temp_input_path):
+                os.unlink(temp_input_path)
 
     except Exception as e:
         logger.exception(f"❌ Audio conversion error: {e}")
@@ -195,10 +198,10 @@ def generate_image():
             return cors({"error": "Image not provided"}, 400)
             
         # Проверка размера
-        if len(image_b64) > 4_000_000:
-            return cors({"error": "Image too large (max 4MB)"}, 413)
+        if len(image_b64) > 3_500_000:
+            return cors({"error": "Image too large (max 3.5MB)"}, 413)
 
-        logger.info(f"🔄 Processing image analysis, prompt length: {len(prompt)}, image size: {len(image_b64)} bytes")
+        logger.info(f"🔄 Processing image analysis, image size: {len(image_b64)} bytes")
 
         payload = {
             "contents": [{
@@ -210,17 +213,17 @@ def generate_image():
             }],
             "generationConfig": {
                 "temperature": 0.1,
-                "maxOutputTokens": 2048,
+                "maxOutputTokens": 1024,
             }
         }
 
         url = (
             "https://generativelanguage.googleapis.com/v1beta/"
-            "models/gemini-2.5-flash:generateContent"
+            "models/gemini-1.5-flash:generateContent"
             f"?key={GEMINI_API_KEY}"
         )
 
-        response = requests.post(url, json=payload, timeout=60)
+        response = requests.post(url, json=payload, timeout=45)
         response.raise_for_status()
         
         result = response.json()
@@ -244,19 +247,23 @@ def generate_image():
         
     except requests.exceptions.Timeout:
         logger.error("⏰ Gemini API timeout")
-        return cors({"error": "AI service timeout"}, 504)
+        return cors({"error": "AI service timeout - try again"}, 504)
     except requests.exceptions.HTTPError as e:
         logger.error(f"🔴 Gemini API HTTP error: {e}")
         status_code = e.response.status_code if e.response else 500
-        return cors({
-            "error": "AI service error", 
-            "details": str(e)
-        }, status_code)
+        
+        if status_code == 429:
+            return cors({"error": "Rate limit exceeded - try again later"}, 429)
+        elif status_code == 403:
+            return cors({"error": "API key invalid or quota exceeded"}, 403)
+        else:
+            return cors({"error": "AI service temporarily unavailable"}, 503)
+            
     except Exception as e:
         logger.exception(f"❌ Image analysis error: {e}")
         return cors({
-            "error": f"Server error: {str(e)}"
-        }, 500)
+            "error": "Service temporarily unavailable - try again"
+        }, 503)
 
 # --- Эндпоинт анализа BirdNET (только текст) ---
 @app.route("/analyze-audio", methods=["POST", "OPTIONS"])
@@ -276,7 +283,7 @@ def analyze_audio():
         if not birdnet_results:
             return cors({"error": "BirdNET results not provided"}, 400)
 
-        logger.info(f"🔄 Processing audio analysis, prompt length: {len(prompt)}")
+        logger.info(f"🔄 Processing audio analysis")
 
         final_prompt = f"{prompt}\n\nРезультаты анализа BirdNET:\n{birdnet_results}"
         
@@ -287,17 +294,17 @@ def analyze_audio():
             }],
             "generationConfig": {
                 "temperature": 0.1,
-                "maxOutputTokens": 1024,
+                "maxOutputTokens": 800,
             }
         }
 
         url = (
             "https://generativelanguage.googleapis.com/v1beta/"
-            "models/gemini-2.5-flash:generateContent"
+            "models/gemini-1.5-flash:generateContent"
             f"?key={GEMINI_API_KEY}"
         )
 
-        response = requests.post(url, json=payload, timeout=30)
+        response = requests.post(url, json=payload, timeout=25)
         response.raise_for_status()
         
         result = response.json()
@@ -321,21 +328,15 @@ def analyze_audio():
         
     except requests.exceptions.Timeout:
         logger.error("⏰ Gemini API timeout for audio analysis")
-        return cors({"error": "AI service timeout"}, 504)
+        return cors({"error": "AI service timeout - try again"}, 504)
     except requests.exceptions.HTTPError as e:
         logger.error(f"🔴 Gemini API HTTP error for audio analysis: {e}")
-        status_code = e.response.status_code if e.response else 500
-        return cors({
-            "error": "AI service error", 
-            "details": str(e)
-        }, status_code)
+        return cors({"error": "AI service temporarily unavailable"}, 503)
     except Exception as e:
         logger.exception(f"❌ Audio analysis error: {e}")
-        return cors({
-            "error": f"Server error: {str(e)}"
-        }, 500)
+        return cors({"error": "Service temporarily unavailable - try again"}, 503)
 
-# --- Health check с информацией о ffmpeg ---
+# --- Health check ---
 @app.route("/health", methods=["GET", "OPTIONS"])
 def health_check():
     if request.method == "OPTIONS":
@@ -346,12 +347,17 @@ def health_check():
         "status": "healthy",
         "timestamp": time.time(),
         "ffmpeg": ffmpeg_status,
-        "gemini_api_key": "configured" if GEMINI_API_KEY else "missing"
+        "service": "image_bird_identifier"
     })
+
+# --- Предварительная инициализация при импорте ---
+logger.info("🚀 Server starting, pre-initializing FFmpeg...")
+ffmpeg_ready = ensure_ffmpeg()
+if ffmpeg_ready:
+    logger.info("🎉 FFmpeg pre-initialized successfully")
+else:
+    logger.warning("⚠️ FFmpeg pre-initialization failed, will try lazy loading")
 
 # --- Локальный запуск ---
 if __name__ == "__main__":
-    logger.info("🚀 Starting server...")
-    # Предварительная инициализация ffmpeg при локальном запуске
-    ensure_ffmpeg()
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(host="0.0.0.0", port=5000, debug=False)
