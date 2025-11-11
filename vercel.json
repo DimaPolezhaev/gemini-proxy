@@ -15,8 +15,7 @@
   "functions": {
     "server.py": {
       "maxDuration": 60,
-      "memory": 3008,
-      "includeFiles": "ffmpeg/**"
+      "memory": 3008
     }
   }
 }

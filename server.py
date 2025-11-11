@@ -10,6 +10,7 @@ import tarfile
 import stat
 import time
 import subprocess
+import sys
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -19,6 +20,8 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 # Глобальные переменные для кэширования
 _ffmpeg_initialized = False
+_ffmpeg_path = None
+_ffprobe_path = None
 
 def cors(payload, code=200):
     resp = make_response(jsonify(payload), code)
@@ -28,84 +31,118 @@ def cors(payload, code=200):
     return resp
 
 def ensure_ffmpeg():
-    global _ffmpeg_initialized
+    global _ffmpeg_initialized, _ffmpeg_path, _ffprobe_path
     
     if _ffmpeg_initialized:
+        logger.info("✅ FFmpeg already initialized")
         return True
         
     logger.info("🔄 Initializing FFmpeg...")
     start_time = time.time()
     
-    ffmpeg_dir = "/tmp/ffmpeg"
-    os.makedirs(ffmpeg_dir, exist_ok=True)
+    # Пробуем разные пути для надежности
+    possible_paths = [
+        "/var/task/ffmpeg",  # Сохраняется между запросами
+        "/tmp/ffmpeg",       # Временный путь
+        "./ffmpeg"           # Текущая директория
+    ]
+    
+    for ffmpeg_dir in possible_paths:
+        try:
+            os.makedirs(ffmpeg_dir, exist_ok=True)
+            _ffmpeg_path = os.path.join(ffmpeg_dir, "ffmpeg")
+            _ffprobe_path = os.path.join(ffmpeg_dir, "ffprobe")
+            
+            # Проверяем существующие бинарники
+            if os.path.exists(_ffmpeg_path) and os.path.exists(_ffprobe_path):
+                logger.info(f"✅ Found existing FFmpeg in {ffmpeg_dir}")
+                break
+                
+            # Скачиваем если нет
+            logger.info(f"📥 Downloading FFmpeg to {ffmpeg_dir}...")
+            ffmpeg_url = "https://github.com/eugeneware/ffmpeg-static/releases/download/b5.0.1/linux-x64"
+            response = requests.get(ffmpeg_url, timeout=60)
+            response.raise_for_status()
+            
+            with open(_ffmpeg_path, "wb") as f:
+                f.write(response.content)
+            
+            # Создаем ffprobe как симлинк
+            if not os.path.exists(_ffprobe_path):
+                os.symlink(_ffmpeg_path, _ffprobe_path)
+            
+            # Права на выполнение
+            os.chmod(_ffmpeg_path, 0o755)
+            os.chmod(_ffprobe_path, 0o755)
+            
+            logger.info(f"✅ FFmpeg downloaded to {ffmpeg_dir}")
+            break
+            
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to setup FFmpeg in {ffmpeg_dir}: {e}")
+            continue
+    
+    if not _ffmpeg_path or not os.path.exists(_ffmpeg_path):
+        logger.error("❌ All FFmpeg setup attempts failed")
+        return False
 
-    ffmpeg_path = os.path.join(ffmpeg_dir, "ffmpeg")
-    ffprobe_path = os.path.join(ffmpeg_dir, "ffprobe")
-
-    # Используем готовые бинарники из нашего проекта
     try:
-        # Скачиваем готовые статические бинарники
-        logger.info("📥 Downloading pre-built FFmpeg...")
+        # Настраиваем pydub
+        AudioSegment.converter = _ffmpeg_path
+        AudioSegment.ffprobe = _ffprobe_path
         
-        # FFmpeg binary
-        ffmpeg_url = "https://github.com/eugeneware/ffmpeg-static/releases/download/b5.0.1/linux-x64"
-        response = requests.get(ffmpeg_url, timeout=30)
-        response.raise_for_status()
+        # Добавляем в PATH
+        ffmpeg_dir = os.path.dirname(_ffmpeg_path)
+        os.environ["PATH"] = ffmpeg_dir + os.pathsep + os.environ.get("PATH", "")
         
-        with open(ffmpeg_path, "wb") as f:
-            f.write(response.content)
-        
-        # FFprobe - создаем симлинк
-        os.symlink(ffmpeg_path, ffprobe_path)
-        
-        # Делаем исполняемыми
-        os.chmod(ffmpeg_path, 0o755)
-        os.chmod(ffprobe_path, 0o755)
-        
-        # Проверяем работоспособность
+        # Тестируем
         result = subprocess.run(
-            [ffmpeg_path, "-version"], 
+            [_ffmpeg_path, "-version"], 
             capture_output=True, 
             text=True, 
             timeout=10
         )
         
         if result.returncode == 0:
-            logger.info(f"✅ FFmpeg initialized successfully: {result.stdout.split()[2]}")
-            
-            # Настраиваем pydub
-            AudioSegment.converter = ffmpeg_path
-            AudioSegment.ffprobe = ffprobe_path
-            os.environ["PATH"] = ffmpeg_dir + os.pathsep + os.environ.get("PATH", "")
-            
+            version = result.stdout.split('\n')[0] if result.stdout else "unknown"
+            logger.info(f"✅ FFmpeg ready: {version}")
             _ffmpeg_initialized = True
-            logger.info(f"🚀 FFmpeg ready in {time.time() - start_time:.2f}s")
             return True
         else:
-            logger.error("❌ FFmpeg test failed")
+            logger.error(f"❌ FFmpeg test failed: {result.stderr}")
             return False
             
     except Exception as e:
-        logger.error(f"❌ FFmpeg initialization failed: {e}")
+        logger.error(f"❌ FFmpeg configuration failed: {e}")
         return False
+
+# Предварительная инициализация
+logger.info("🚀 Server starting, initializing FFmpeg...")
+ffmpeg_ready = ensure_ffmpeg()
+if ffmpeg_ready:
+    logger.info("🎉 FFmpeg initialized successfully")
+else:
+    logger.warning("⚠️ FFmpeg initialization failed, audio features will not work")
 
 # --- Пинг ---
 @app.route("/ping", methods=["GET", "OPTIONS"])
 def ping():
     if request.method == "OPTIONS":
         return cors({})
-    return cors({"status": "alive", "timestamp": time.time()})
+    return cors({
+        "status": "alive", 
+        "timestamp": time.time(),
+        "ffmpeg_ready": _ffmpeg_initialized
+    })
 
 # --- Главная страница ---
 @app.route("/", methods=["GET", "OPTIONS"])
 def home():
     if request.method == "OPTIONS":
         return cors({})
-    
-    ffmpeg_status = "ready" if _ffmpeg_initialized else "not_initialized"
     return cors({
         "status": "✅ Server is running", 
-        "ffmpeg": ffmpeg_status,
+        "ffmpeg_ready": _ffmpeg_initialized,
         "timestamp": time.time()
     })
 
@@ -116,11 +153,10 @@ def convert_audio():
         return cors({})
 
     try:
-        # Ленивая инициализация ffmpeg
         if not ensure_ffmpeg():
             return cors({
-                "error": "FFmpeg initialization failed", 
-                "message": "Audio conversion unavailable"
+                "error": "FFmpeg not available", 
+                "message": "Audio conversion temporarily unavailable"
             }, 503)
 
         data = request.get_json(silent=True) or {}
@@ -130,47 +166,32 @@ def convert_audio():
         if not audio_data:
             return cors({"error": "Audio data not provided"}, 400)
 
-        # Проверка размера
-        if len(audio_data) > 8_000_000:  # ~8MB
+        if len(audio_data) > 8_000_000:
             return cors({"error": "Audio file too large (max 8MB)"}, 413)
 
         logger.info(f"🔄 Converting audio: {filename}, size: {len(audio_data)} bytes")
         
-        # Декодируем base64
         audio_bytes = base64.b64decode(audio_data)
         
-        # Сохраняем во временный файл
-        with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{filename}") as temp_input:
-            temp_input.write(audio_bytes)
-            temp_input_path = temp_input.name
+        # Конвертируем в WAV
+        audio_file = io.BytesIO(audio_bytes)
+        audio = AudioSegment.from_file(audio_file)
+        audio = audio.set_frame_rate(48000).set_channels(1).set_sample_width(2)
 
-        try:
-            # Определяем формат файла
-            audio_file = io.BytesIO(audio_bytes)
-            
-            # Конвертируем в WAV с помощью pydub
-            audio = AudioSegment.from_file(audio_file)
-            audio = audio.set_frame_rate(48000).set_channels(1).set_sample_width(2)
+        wav_buffer = io.BytesIO()
+        audio.export(wav_buffer, format="wav")
+        wav_bytes = wav_buffer.getvalue()
+        wav_base64 = base64.b64encode(wav_bytes).decode("utf-8")
 
-            wav_buffer = io.BytesIO()
-            audio.export(wav_buffer, format="wav")
-            wav_bytes = wav_buffer.getvalue()
-            wav_base64 = base64.b64encode(wav_bytes).decode("utf-8")
-
-            logger.info(f"✅ Audio converted successfully: {len(wav_bytes)} bytes")
-            
-            return cors({
-                "success": True,
-                "wav_data": wav_base64,
-                "original_size": len(audio_bytes),
-                "converted_size": len(wav_bytes),
-                "message": "Audio converted to WAV successfully"
-            })
-            
-        finally:
-            # Очищаем временные файлы
-            if os.path.exists(temp_input_path):
-                os.unlink(temp_input_path)
+        logger.info(f"✅ Audio converted successfully: {len(wav_bytes)} bytes")
+        
+        return cors({
+            "success": True,
+            "wav_data": wav_base64,
+            "original_size": len(audio_bytes),
+            "converted_size": len(wav_bytes),
+            "message": "Audio converted to WAV successfully"
+        })
 
     except Exception as e:
         logger.exception(f"❌ Audio conversion error: {e}")
@@ -197,7 +218,6 @@ def generate_image():
         if not image_b64:
             return cors({"error": "Image not provided"}, 400)
             
-        # Проверка размера
         if len(image_b64) > 3_500_000:
             return cors({"error": "Image too large (max 3.5MB)"}, 413)
 
@@ -342,22 +362,14 @@ def health_check():
     if request.method == "OPTIONS":
         return cors({})
     
-    ffmpeg_status = "ready" if _ffmpeg_initialized else "not_initialized"
     return cors({
         "status": "healthy",
         "timestamp": time.time(),
-        "ffmpeg": ffmpeg_status,
-        "service": "image_bird_identifier"
+        "ffmpeg_ready": _ffmpeg_initialized,
+        "service": "bird_identifier_api"
     })
-
-# --- Предварительная инициализация при импорте ---
-logger.info("🚀 Server starting, pre-initializing FFmpeg...")
-ffmpeg_ready = ensure_ffmpeg()
-if ffmpeg_ready:
-    logger.info("🎉 FFmpeg pre-initialized successfully")
-else:
-    logger.warning("⚠️ FFmpeg pre-initialization failed, will try lazy loading")
 
 # --- Локальный запуск ---
 if __name__ == "__main__":
+    logger.info("🚀 Starting optimized server...")
     app.run(host="0.0.0.0", port=5000, debug=False)
