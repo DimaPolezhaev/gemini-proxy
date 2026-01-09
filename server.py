@@ -4,7 +4,8 @@ import requests
 import base64
 import tempfile
 import io
-from flask import Flask, request, jsonify, make_response
+import traceback
+from flask import Flask, json, request, jsonify, make_response
 from pydub import AudioSegment
 import tarfile
 import stat
@@ -239,23 +240,39 @@ def generate_image():
 
         url = (
             "https://generativelanguage.googleapis.com/v1beta/"
-            "models/gemini-1.5-flash:generateContent"
+            "models/gemini-2.5-flash-lite:generateContent"
             f"?key={GEMINI_API_KEY}"
         )
 
+        logger.info(f"📤 Sending request to Gemini API...")
         response = requests.post(url, json=payload, timeout=45)
         response.raise_for_status()
         
         result = response.json()
-        text = (result
-                 .get("candidates", [{}])[0]
-                 .get("content", {})
-                 .get("parts", [{}])[0]
-                 .get("text", ""))
+        logger.info(f"📥 Raw Gemini response: {json.dumps(result, indent=2)}")  # ДЕБАГ
+        
+        # Более надежное извлечение текста
+        text = ""
+        candidates = result.get("candidates", [])
+        if candidates:
+            first_candidate = candidates[0]
+            content = first_candidate.get("content", {})
+            parts = content.get("parts", [])
+            if parts:
+                text = parts[0].get("text", "")
+        
+        logger.info(f"📝 Extracted text: '{text}'")  # ДЕБАГ
                  
         if not text.strip():
             logger.warning("⚠️ Empty response from Gemini API")
-            return cors({"error": "Empty response from AI service"}, 502)
+            # Возвращаем более информативную ошибку
+            return cors({
+                "error": "Empty response from AI service",
+                "debug": {
+                    "candidates_count": len(candidates),
+                    "raw_response": result
+                }
+            }, 502)
             
         processing_time = time.time() - start_time
         logger.info(f"✅ Image analysis completed in {processing_time:.2f}s")
@@ -270,20 +287,23 @@ def generate_image():
         return cors({"error": "AI service timeout - try again"}, 504)
     except requests.exceptions.HTTPError as e:
         logger.error(f"🔴 Gemini API HTTP error: {e}")
+        logger.error(f"🔴 Response content: {e.response.text if e.response else 'No response'}")
         status_code = e.response.status_code if e.response else 500
         
         if status_code == 429:
             return cors({"error": "Rate limit exceeded - try again later"}, 429)
         elif status_code == 403:
             return cors({"error": "API key invalid or quota exceeded"}, 403)
+        elif status_code == 503:
+            return cors({"error": "AI service temporarily overloaded - try again in a minute"}, 503)
         else:
-            return cors({"error": "AI service temporarily unavailable"}, 503)
+            return cors({"error": f"AI service error: {status_code}"}, status_code)
             
     except Exception as e:
         logger.exception(f"❌ Image analysis error: {e}")
         return cors({
-            "error": "Service temporarily unavailable - try again"
-        }, 503)
+            "error": f"Service error: {str(e)}"
+        }, 500)
 
 # --- Эндпоинт анализа BirdNET (только текст) ---
 @app.route("/analyze-audio", methods=["POST", "OPTIONS"])
@@ -320,7 +340,7 @@ def analyze_audio():
 
         url = (
             "https://generativelanguage.googleapis.com/v1beta/"
-            "models/gemini-1.5-flash:generateContent"
+            "models/gemini-2.5-flash-lite:generateContent"
             f"?key={GEMINI_API_KEY}"
         )
 
@@ -356,17 +376,219 @@ def analyze_audio():
         logger.exception(f"❌ Audio analysis error: {e}")
         return cors({"error": "Service temporarily unavailable - try again"}, 503)
 
+# --- Эндпоинт для анализа видео через File API метод ---
+@app.route("/analyze-video", methods=["POST", "OPTIONS"])
+def analyze_video():
+    if request.method == "OPTIONS":
+        return cors({})
+
+    start_time = time.time()
+    
+    try:
+        data = request.get_json(silent=True) or {}
+        prompt = data.get("prompt")
+        video_b64 = data.get("video_base64")
+        mime_type = data.get("mime_type", "video/mp4")
+
+        if not prompt:
+            return cors({"error": "Prompt not provided"}, 400)
+        if not video_b64:
+            return cors({"error": "Video data not provided"}, 400)
+            
+        # Проверяем размер видео (максимум 4.5 МБ для Vercel)
+        if len(video_b64) > 4_500_000:
+            return cors({
+                "error": "Video file too large (max 4.5MB)",
+                "size": len(video_b64),
+                "max_allowed": 4500000
+            }, 413)
+            
+        # Проверяем минимальный размер
+        if len(video_b64) < 1000:
+            return cors({"error": "Video file too small"}, 400)
+
+        logger.info(f"🔄 Processing video analysis, data size: {len(video_b64)} bytes")
+
+        # ПРОСТОЙ МЕТОД - как в HTML странице
+        # Используем inlineData вместо File API
+        payload = {
+            "contents": [{
+                "parts": [
+                    {
+                        "inlineData": {
+                            "mimeType": mime_type,
+                            "data": video_b64
+                        }
+                    },
+                    {
+                        "text": prompt
+                    }
+                ]
+            }],
+            "generationConfig": {
+                "temperature": 0.1,
+                "topP": 0.8,
+                "topK": 40,
+                "maxOutputTokens": 2048,
+            }
+        }
+        
+        url = (
+            "https://generativelanguage.googleapis.com/v1beta/"
+            "models/gemini-2.5-flash-lite:generateContent"
+            f"?key={GEMINI_API_KEY}"
+        )
+        
+        logger.info(f"📤 Sending request to Gemini API...")
+        logger.info(f"📊 Payload size: {len(json.dumps(payload))} chars")
+        
+        response = requests.post(
+            url, 
+            json=payload, 
+            timeout=30,
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json"
+            }
+        )
+        
+        if response.status_code != 200:
+            logger.error(f"🔴 Gemini API error: {response.status_code}")
+            logger.error(f"🔴 Response: {response.text[:500]}")
+            
+            if response.status_code == 400:
+                # Попробуем альтернативный формат (иногда помогает)
+                logger.info("🔄 Trying alternative payload format...")
+                payload_alt = {
+                    "contents": [{
+                        "role": "user",
+                        "parts": [
+                            {
+                                "inlineData": {
+                                    "mimeType": mime_type,
+                                    "data": video_b64
+                                }
+                            },
+                            {
+                                "text": prompt
+                            }
+                        ]
+                    }],
+                    "generationConfig": {
+                        "temperature": 0.1,
+                        "maxOutputTokens": 2048,
+                    }
+                }
+                
+                response = requests.post(url, json=payload_alt, timeout=30)
+                response.raise_for_status()
+            else:
+                response.raise_for_status()
+        
+        result = response.json()
+        logger.info(f"📥 Raw response keys: {result.keys() if isinstance(result, dict) else 'not dict'}")
+        
+        # Извлекаем текст ответа
+        text = ""
+        candidates = result.get("candidates", [])
+        if candidates:
+            first_candidate = candidates[0]
+            content = first_candidate.get("content", {})
+            parts = content.get("parts", [])
+            if parts:
+                text = parts[0].get("text", "")
+        
+        # Альтернативный путь извлечения
+        if not text and isinstance(result.get("candidates"), list):
+            for candidate in result["candidates"]:
+                if "content" in candidate and "parts" in candidate["content"]:
+                    for part in candidate["content"]["parts"]:
+                        if "text" in part:
+                            text = part["text"]
+                            break
+                if text:
+                    break
+        
+        if not text.strip():
+            logger.warning("⚠️ Empty response from Gemini API")
+            logger.warning(f"⚠️ Full response: {json.dumps(result, indent=2)}")
+            return cors({
+                "error": "Empty response from AI service",
+                "debug": {
+                    "candidates_count": len(candidates),
+                    "has_parts": bool(parts) if 'parts' in locals() else False
+                }
+            }, 502)
+            
+        processing_time = time.time() - start_time
+        logger.info(f"✅ Video analysis completed in {processing_time:.2f}s")
+        
+        return cors({
+            "response": text,
+            "processing_time": processing_time
+        })
+        
+    except requests.exceptions.Timeout:
+        logger.error("⏰ Gemini API timeout")
+        return cors({"error": "AI service timeout - try again"}, 504)
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"🔴 Gemini API HTTP error: {e}")
+        status_code = e.response.status_code if e.response else 500
+        error_details = ""
+        
+        if e.response and e.response.text:
+            try:
+                error_json = e.response.json()
+                error_details = error_json.get("error", {}).get("message", e.response.text[:200])
+            except:
+                error_details = e.response.text[:200]
+        
+        if status_code == 429:
+            return cors({"error": "Rate limit exceeded - try again later"}, 429)
+        elif status_code == 413:
+            return cors({"error": "Video file too large for processing"}, 413)
+        elif status_code == 400:
+            return cors({
+                "error": "Invalid video format or API error",
+                "details": error_details
+            }, 400)
+        else:
+            return cors({
+                "error": f"AI service error: {status_code}",
+                "details": error_details
+            }, status_code)
+            
+    except Exception as e:
+        logger.exception(f"❌ Video analysis error: {type(e).__name__}: {str(e)}")
+        return cors({
+            "error": f"Video processing error: {type(e).__name__}",
+            "message": str(e)[:200]
+        }, 500)
+
 # --- Health check ---
 @app.route("/health", methods=["GET", "OPTIONS"])
 def health_check():
     if request.method == "OPTIONS":
         return cors({})
     
+    # Проверяем доступность Gemini API
+    gemini_status = "unknown"
+    try:
+        test_response = requests.get(
+            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite?key={GEMINI_API_KEY}",
+            timeout=5
+        )
+        gemini_status = "available" if test_response.status_code == 200 else "unavailable"
+    except Exception as e:
+        gemini_status = f"unavailable: {str(e)[:100]}"
+    
     return cors({
         "status": "healthy",
         "timestamp": time.time(),
         "ffmpeg_ready": _ffmpeg_initialized,
-        "service": "bird_identifier_api"
+        "gemini_api": gemini_status,
+        "service": "nature_identifier_api",
+        "features": ["image", "audio", "video"]
     })
 
 # --- Локальный запуск ---
